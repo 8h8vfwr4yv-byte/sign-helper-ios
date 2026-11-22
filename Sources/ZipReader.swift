@@ -74,7 +74,11 @@ struct ZipArchive {
 
     private func inflate(_ raw: Data, expectedSize: Int) -> Data? {
         guard expectedSize > 0 else { return Data() }
-        var stream = compression_stream(dst_ptr: nil, dst_size: 0, src_ptr: nil, src_size: 0, state: nil)
+        let dstDummy = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+        let srcDummy = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+        var stream = compression_stream(dst_ptr: dstDummy, dst_size: 0, src_ptr: UnsafePointer(srcDummy), src_size: 0, state: nil)
+        dstDummy.deallocate()
+        srcDummy.deallocate()
         guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else { return nil }
         defer { compression_stream_destroy(&stream) }
         var output = Data(count: expectedSize)

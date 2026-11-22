@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 @main
 struct SignHelperApp: App {
     @StateObject private var library = LibraryStore()
+    @StateObject private var signLog = SignLog()
 
     var body: some Scene {
         WindowGroup {
@@ -12,10 +13,54 @@ struct SignHelperApp: App {
                     .tabItem { Label("IPA 库", systemImage: "square.stack.3d.up") }
                 SignView()
                     .tabItem { Label("签名", systemImage: "signature") }
+                LogView()
+                    .tabItem { Label("日志", systemImage: "list.bullet.rectangle") }
                 AboutView()
                     .tabItem { Label("说明", systemImage: "info.circle") }
             }
             .environmentObject(library)
+            .environmentObject(signLog)
+        }
+    }
+}
+
+// MARK: - 签名日志
+
+struct LogEntry: Identifiable, Codable {
+    var id: String
+    var time: Date
+    var text: String
+}
+
+final class SignLog: ObservableObject {
+    @Published var entries: [LogEntry] = []
+
+    private var fileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("signlog.json")
+    }
+
+    init() {
+        if let data = try? Data(contentsOf: fileURL),
+           let list = try? JSONDecoder().decode([LogEntry].self, from: data) {
+            entries = list
+        }
+    }
+
+    func add(_ text: String) {
+        entries.insert(LogEntry(id: UUID().uuidString, time: Date(), text: text), at: 0)
+        if entries.count > 500 { entries = Array(entries.prefix(500)) }
+        persist()
+    }
+
+    func clear() {
+        entries = []
+        persist()
+    }
+
+    private func persist() {
+        if let data = try? JSONEncoder().encode(entries) {
+            try? data.write(to: fileURL, options: .atomic)
         }
     }
 }
@@ -81,17 +126,17 @@ final class LibraryStore: ObservableObject {
     func fileURL(for app: StoredApp) -> URL { dir.appendingPathComponent(app.fileName) }
     func iconURL(for app: StoredApp) -> URL { dir.appendingPathComponent(app.id + ".png") }
 
-    func importIPA(from src: URL) -> String? {
+    func importIPA(from src: URL) -> (error: String?, app: StoredApp?) {
         let accessing = src.startAccessingSecurityScopedResource()
         defer { if accessing { src.stopAccessingSecurityScopedResource() } }
-        guard let data = try? Data(contentsOf: src) else { return "读取文件失败" }
-        guard let parsed = IPAParser.parse(data: data) else { return "解析失败：这不是有效的 IPA 文件" }
+        guard let data = try? Data(contentsOf: src) else { return ("读取文件失败", nil) }
+        guard let parsed = IPAParser.parse(data: data) else { return ("解析失败：这不是有效的 IPA 文件", nil) }
         let id = UUID().uuidString
         let fileName = id + ".ipa"
         do {
             try data.write(to: dir.appendingPathComponent(fileName), options: .atomic)
         } catch {
-            return "保存到 IPA 库失败"
+            return ("保存到 IPA 库失败", nil)
         }
         if let icon = parsed.iconData {
             try? icon.write(to: dir.appendingPathComponent(id + ".png"), options: .atomic)
@@ -109,7 +154,7 @@ final class LibraryStore: ObservableObject {
         apps.append(stored)
         sortApps()
         persist()
-        return nil
+        return (nil, stored)
     }
 
     func delete(_ app: StoredApp) {
@@ -130,6 +175,7 @@ func formatBytes(_ n: Int) -> String {
 
 struct LibraryView: View {
     @EnvironmentObject var library: LibraryStore
+    @EnvironmentObject var signLog: SignLog
     @State private var showImporter = false
     @State private var importError: String? = nil
 
@@ -140,7 +186,7 @@ struct LibraryView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("IPA 库是空的")
                             .font(.headline)
-                        Text("点右上角 + 导入 IPA 文件。本助手会解析它的名称、版本、签名状态和描述文件到期时间——个人免费证书只有 7 天有效期，到期前记得用 AltStore / SideStore 续签。")
+                        Text("点右上角 + 用文件选择器加载本地 IPA。本助手会解析它的名称、版本、签名状态和描述文件到期时间——个人免费证书只有 7 天有效期，到期前记得续签。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -153,7 +199,10 @@ struct LibraryView: View {
                         AppRow(app: app)
                     }
                     .swipeActions(edge: .trailing) {
-                        Button("删除", role: .destructive) { library.delete(app) }
+                        Button("删除", role: .destructive) {
+                            signLog.add("从 IPA 库删除：\(app.displayName)（\(app.bundleId)）")
+                            library.delete(app)
+                        }
                     }
                 }
             }
@@ -168,7 +217,14 @@ struct LibraryView: View {
                           allowsMultipleSelection: true) { result in
                 if case .success(let urls) = result {
                     for url in urls {
-                        if let err = library.importIPA(from: url) { importError = err }
+                        let outcome = library.importIPA(from: url)
+                        if let err = outcome.error {
+                            importError = err
+                            signLog.add("导入失败：\(err)")
+                        } else if let app = outcome.app {
+                            let state = app.signed ? "已签名" : "未签名"
+                            signLog.add("导入 IPA：\(app.displayName)（\(app.bundleId)），\(state)")
+                        }
                     }
                 }
             }
@@ -243,9 +299,9 @@ struct AppRow: View {
 
 struct AppDetailView: View {
     @EnvironmentObject var library: LibraryStore
+    @EnvironmentObject var signLog: SignLog
     @Environment(\.dismiss) private var dismiss
     let app: StoredApp
-    @State private var showSignNotice = false
     @State private var showDeleteConfirm = false
 
     var body: some View {
@@ -277,14 +333,9 @@ struct AppDetailView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Section {
-                Button {
-                    showSignNotice = true
-                } label: {
-                    Label(app.signed ? "续签这个 IPA" : "给这个 IPA 签名", systemImage: "signature")
-                }
+            Section("导出结果") {
                 ShareLink(item: library.fileURL(for: app)) {
-                    Label("分享 / 导出 IPA", systemImage: "square.and.arrow.up")
+                    Label("导出 / 分享这个 IPA", systemImage: "square.and.arrow.up")
                 }
                 Button(role: .destructive) {
                     showDeleteConfirm = true
@@ -295,14 +346,10 @@ struct AppDetailView: View {
         }
         .navigationTitle(app.displayName)
         .navigationBarTitleDisplayMode(.inline)
-        .alert("签名入口", isPresented: $showSignNotice) {
-            Button("知道了", role: .cancel) {}
-        } message: {
-            Text("真正的签名要向苹果服务器申请证书和描述文件，并对 Mach-O 重新签名——这一步需要 AltServer（电脑）或 SideStore（本机）配合完成，本助手内无法独立完成（原因见“签名”页）。建议：把 IPA 导出后用你现在在用的签名工具续签，或按“签名”页的两条路线操作。")
-        }
         .alert("删除这个 IPA？", isPresented: $showDeleteConfirm) {
             Button("取消", role: .cancel) {}
             Button("删除", role: .destructive) {
+                signLog.add("从 IPA 库删除：\(app.displayName)（\(app.bundleId)）")
                 library.delete(app)
                 dismiss()
             }
@@ -318,94 +365,251 @@ struct AppDetailView: View {
     }
 }
 
-// MARK: - 签名页
+// MARK: - 签名页（模式区分）
+
+enum SignMode: String, CaseIterable, Identifiable {
+    case backend = "后端签名"
+    case local = "本地签名（实验性）"
+    var id: String { rawValue }
+}
 
 struct SignView: View {
-    @State private var message: String? = nil
+    @EnvironmentObject var library: LibraryStore
+    @EnvironmentObject var signLog: SignLog
+
+    @State private var mode: SignMode = .backend
+    @State private var selectedAppId: String = ""
+    @AppStorage("backendEndpoint") private var endpoint: String = ""
+    @AppStorage("savedAppleId") private var appleId: String = ""
+    @State private var password: String = ""
+    @State private var busy = false
+    @State private var resultFile: URL? = nil
+    @State private var resultNote: String = ""
+
+    private var selectedApp: StoredApp? {
+        library.apps.first { $0.id == selectedAppId } ?? library.apps.first
+    }
 
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label("为什么这个助手里没有“输入 Apple ID 就能签名”", systemImage: "lock.shield")
-                            .font(.subheadline.weight(.semibold))
-                        Text("用个人 Apple ID 签名，背后要完成一整套与苹果服务器的认证：SRP 登录、anisette 设备信任数据、注册设备、申请免费证书（7 天有效）、生成描述文件、最后对 IPA 里的 Mach-O 逐个重新签名。这套流程目前只有 AltStore / SideStore 这类专门工具实现了：\n\n· AltStore：签名在电脑上的 AltServer 完成，手机端负责管理与续签提醒；\n· SideStore：AltStore 的分支，把签名搬到手机上，靠本地 VPN 回环 + anisette 服务器实现。\n\n本助手如果放一个 Apple ID 密码框，既连不上苹果的签名服务、签不了名，还会让你白白交出密码——所以这里不做登录框。助手负责签名之外同样重要的部分：管理 IPA 库、解析每个 IPA 的签名与到期时间、到期前提醒你续签。")
+                Section("选择 IPA") {
+                    if library.apps.isEmpty {
+                        Text("IPA 库是空的，先到“IPA 库”页导入一个 IPA。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("待签名 IPA", selection: Binding(
+                            get: { selectedApp?.id ?? "" },
+                            set: { selectedAppId = $0 }
+                        )) {
+                            ForEach(library.apps) { app in
+                                Text("\(app.displayName)（\(app.signed ? "已签名" : "未签名")）").tag(app.id)
+                            }
+                        }
+                    }
+                }
+
+                Section("签名模式") {
+                    Picker("模式", selection: $mode) {
+                        ForEach(SignMode.allCases) { m in
+                            Text(m.rawValue).tag(m)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    if mode == .backend {
+                        Text("后端模式：把 IPA 与 Apple ID 提交到你自己配置的签名服务器，由服务器完成向苹果申请证书、生成描述文件与重签名。本助手只做客户端提交与结果导出。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("本地模式（实验性）：依赖外部开源签名组件（如 ldid / zsign 类工具）在本机重签名。iOS 官方 SDK 没有内置代码签名接口，本构建未集成此类组件，高版本原生环境下也可能失效——此模式当前只记录流程日志并导出原始 IPA 副本。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    .padding(.vertical, 4)
                 }
 
-                Section("路线一 · AltStore（电脑配合）") {
-                    step("1", "电脑装 AltServer，手机与电脑连同一 Wi-Fi（首次用数据线）")
-                    step("2", "AltServer 托盘图标 → Install AltStore → 输入 Apple ID 登录，AltStore 装到手机")
-                    step("3", "手机打开 AltStore → My Apps → + 选择 IPA，用同一 Apple ID 签名安装")
-                    step("4", "每 7 天内让 AltStore 后台自动刷新，或打开 AltStore 点 Refresh All")
-                    Button {
-                        openSite("https://altstore.io", label: "AltStore 官网")
-                    } label: {
-                        Label("打开 AltStore 官网", systemImage: "safari")
+                if mode == .backend {
+                    Section("后端签名接口") {
+                        TextField("接口地址（https://…，你自己的服务器）", text: $endpoint)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Text("接口约定：POST multipart/form-data，字段 apple_id、password，文件字段名为 ipa；成功时直接返回签名后的 IPA 文件数据。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    Button {
-                        tryScheme("altstore://", label: "AltStore")
-                    } label: {
-                        Label("检测本机 AltStore", systemImage: "magnifyingglass")
+                    Section("Apple ID 登录") {
+                        TextField("Apple ID（邮箱）", text: $appleId)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.emailAddress)
+                        SecureField("密码（仅本次请求使用，不保存、不写日志）", text: $password)
+                        Text("密码只保存在内存里、随本次请求发给上面你自己配置的接口，用完即弃；不会存入设备、不会出现在日志中。没有你自己的签名服务器时请用本地模式或 AltStore / SideStore。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Section {
+                        Button {
+                            Task { await runBackendSign() }
+                        } label: {
+                            if busy {
+                                HStack { ProgressView(); Text("正在提交后端签名…") }
+                            } else {
+                                Label("登录并签名（后端）", systemImage: "signature")
+                            }
+                        }
+                        .disabled(busy || selectedApp == nil)
+                    }
+                } else {
+                    Section("本地签名（实验性）") {
+                        Button {
+                            runLocalSign()
+                        } label: {
+                            Label("尝试本地签名（实验性）", systemImage: "flask")
+                        }
+                        .disabled(selectedApp == nil)
                     }
                 }
 
-                Section("路线二 · SideStore（无需电脑续签）") {
-                    step("1", "按 SideStore 官网教程首次配对（需要一次电脑生成配对文件）")
-                    step("2", "SideStore 内导入 IPA，用 Apple ID 签名安装")
-                    step("3", "开启它的本地 VPN 回环后，可直接在手机上续签")
-                    Button {
-                        openSite("https://sidestore.io", label: "SideStore 官网")
-                    } label: {
-                        Label("打开 SideStore 官网", systemImage: "safari")
-                    }
-                    Button {
-                        tryScheme("sidestore://", label: "SideStore")
-                    } label: {
-                        Label("检测本机 SideStore", systemImage: "magnifyingglass")
+                if let resultFile {
+                    Section("导出结果") {
+                        if !resultNote.isEmpty {
+                            Text(resultNote)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        ShareLink(item: resultFile) {
+                            Label("导出结果 IPA", systemImage: "square.and.arrow.up")
+                        }
                     }
                 }
 
-                Section {
-                    Text("提示：免费证书签名的 App 最多同时装 3 个（每个 App 的 App ID 也有限额），7 天到期后 App 会打不开，续签即可恢复，数据不丢。本助手 IPA 库里每个条目的“剩余天数”就是按描述文件到期时间算的。")
+                Section("其他可行路线") {
+                    Text("没有自建后端时，成熟路线是 AltStore（电脑 AltServer 签名）或 SideStore（本机签名）：官网 altstore.io / sidestore.io，按其教程用 Apple ID 登录即可。本助手的价值在于签名之外：管理 IPA 库、解析到期时间、记录签名日志。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
             .navigationTitle("签名")
-            .alert("提示", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
-                Button("知道了", role: .cancel) {}
-            } message: { Text(message ?? "") }
         }
     }
 
-    private func step(_ n: String, _ text: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text(n)
-                .font(.caption.weight(.bold))
-                .frame(width: 20, height: 20)
-                .background(Color.blue, in: Circle())
-                .foregroundStyle(.white)
-            Text(text).font(.subheadline)
+    // 后端签名：把 IPA 与 Apple ID 提交到用户配置的接口
+    private func runBackendSign() async {
+        guard let app = selectedApp else { return }
+        let ep = endpoint.trimmingCharacters(in: .whitespaces)
+        let aid = appleId.trimmingCharacters(in: .whitespaces)
+        signLog.add("后端签名开始：\(app.displayName)（\(app.bundleId)）")
+        guard let url = URL(string: ep), ep.hasPrefix("https://") else {
+            signLog.add("后端签名失败：未配置有效的 https 接口地址")
+            resultNote = "未配置后端接口地址，请先在上方填写你自己的签名服务器地址。"
+            resultFile = nil
+            return
         }
-        .padding(.vertical, 1)
+        guard !aid.isEmpty, !password.isEmpty else {
+            signLog.add("后端签名失败：Apple ID 或密码为空")
+            resultNote = "请填写 Apple ID 与密码。"
+            resultFile = nil
+            return
+        }
+        busy = true
+        defer { busy = false }
+        do {
+            let ipaData = try Data(contentsOf: library.fileURL(for: app))
+            signLog.add("正在上传 IPA（\(formatBytes(ipaData.count))）到后端接口…")
+            let boundary = "Boundary-\(UUID().uuidString)"
+            var body = Data()
+            func field(_ name: String, _ value: String) {
+                body.append("--\(boundary)\r\n".data(using: .utf8)!)
+                body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+                body.append("\(value)\r\n".data(using: .utf8)!)
+            }
+            field("apple_id", aid)
+            field("password", password)
+            body.append("--\(boundary)\r\n".data(using: .utf8)!)
+            body.append("Content-Disposition: form-data; name=\"ipa\"; filename=\"app.ipa\"\r\n".data(using: .utf8)!)
+            body.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
+            body.append(ipaData)
+            body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            request.httpBody = body
+            request.timeoutInterval = 180
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            password = ""
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if code == 200, data.count > 22, data.prefix(2).elementsEqual([0x50, 0x4B]) {
+                let outDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("SignedOutput", isDirectory: true)
+                try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+                let outURL = outDir.appendingPathComponent(app.displayName + "-signed.ipa")
+                try data.write(to: outURL, options: .atomic)
+                resultFile = outURL
+                resultNote = "后端签名成功（\(formatBytes(data.count))），可导出后安装。"
+                signLog.add("后端签名成功：\(app.displayName)，结果 \(formatBytes(data.count))，已保存待导出")
+            } else {
+                let snippet = String(data: data.prefix(200), encoding: .utf8) ?? ""
+                resultFile = nil
+                resultNote = "后端返回异常（HTTP \(code)），未得到签名 IPA。"
+                signLog.add("后端签名失败：HTTP \(code) \(snippet)")
+            }
+        } catch {
+            password = ""
+            resultFile = nil
+            resultNote = "请求失败：\(error.localizedDescription)"
+            signLog.add("后端签名失败：\(error.localizedDescription)")
+        }
     }
 
-    private func openSite(_ urlString: String, label: String) {
-        if let url = URL(string: urlString) {
-            UIApplication.shared.open(url)
-            message = "已打开\(label)，请按官网指引操作。"
-        }
+    // 本地签名（实验性）：无官方接口、未集成外部组件——如实记录并导出原始副本
+    private func runLocalSign() {
+        guard let app = selectedApp else { return }
+        signLog.add("本地签名（实验性）开始：\(app.displayName)（\(app.bundleId)）")
+        signLog.add("本地签名：iOS 官方 SDK 无内置代码签名接口，实验性签名依赖外部开源组件（ldid / zsign 类），本构建未集成")
+        signLog.add("本地签名未执行：高版本原生环境下外部签名组件可能失效，导出结果为原始 IPA 副本（\(app.signed ? "保持原签名状态" : "仍未签名")）")
+        resultFile = library.fileURL(for: app)
+        resultNote = "本地签名（实验性）在本构建中未实际执行：导出的是原始 IPA 副本。真正签名请使用后端模式或 AltStore / SideStore。"
     }
+}
 
-    private func tryScheme(_ scheme: String, label: String) {
-        guard let url = URL(string: scheme) else { return }
-        UIApplication.shared.open(url, options: [:]) { ok in
-            message = ok ? "本机已安装 \(label)，已为你打开。" : "本机似乎还没装 \(label)（或系统不允许这样打开），请先按上面的路线安装。"
+// MARK: - 日志页
+
+struct LogView: View {
+    @EnvironmentObject var signLog: SignLog
+    @State private var showClearConfirm = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if signLog.entries.isEmpty {
+                    Text("暂无日志。导入 IPA、执行签名等操作都会记录在这里（不含密码等敏感信息）。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(signLog.entries) { entry in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(entry.text)
+                            .font(.subheadline)
+                        Text(entry.time.formatted(date: .abbreviated, time: .standard))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            .navigationTitle("签名日志")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("清空") { showClearConfirm = true }
+                        .disabled(signLog.entries.isEmpty)
+                }
+            }
+            .alert("清空全部日志？", isPresented: $showClearConfirm) {
+                Button("取消", role: .cancel) {}
+                Button("清空", role: .destructive) { signLog.clear() }
+            }
         }
     }
 }
@@ -429,21 +633,29 @@ struct AboutView: View {
         """
         IPA 签名助手 · 说明
 
-        一、这个工具做什么
-        · 导入并管理 IPA 文件库（文件只存在本 App 的沙盒里）
+        本项目为技术学习演示项目。
+
+        一、重要备注
+        · iOS 官方 SDK 没有内置代码签名接口，任何“在 App 内直接签名”的实现都依赖苹果未公开的流程或外部开源组件，并非系统提供的能力。
+        · 本地签名属于实验性功能：依赖外部开源组件（如 ldid / zsign 类签名器），在高版本原生环境下可能失效；本构建未集成此类组件，本地模式只记录流程并导出原始 IPA 副本。
+        · 后端模式为可选对接：由你自备签名服务器，本助手只负责按约定接口提交 IPA 与 Apple ID 并导出返回结果；密码仅在内存中使用，不保存、不写入日志。
+
+        二、这个工具做什么
+        · 用文件选择器加载本地 IPA，管理 IPA 库（文件只存在本 App 沙盒里）
         · 解析每个 IPA 的名称、Bundle ID、版本、图标
-        · 解析签名状态与 embedded.mobileprovision：团队、Team ID、到期时间，并算出剩余天数，方便你在 7 天免费证书到期前续签
-        · 导出/分享 IPA 给真正的签名工具使用
+        · 解析签名状态与 embedded.mobileprovision：团队、Team ID、到期时间，算出剩余天数
+        · 签名状态日志：导入、签名尝试、结果都会记录，可查看与清空
+        · 导出结果：详情页可导出原始 IPA，签名页可导出后端返回的签名结果
 
-        二、这个工具不做什么
-        · 不收集、不保存你的 Apple ID 和密码（没有登录框）
-        · 不直接给 IPA 签名——签名需要与苹果服务器完成证书申请与 anisette 认证，目前由 AltStore（AltServer）或 SideStore 实现，本助手提供完整路线指引与本机检测
-        · 本助手自身也是一个未签名 IPA，首次安装同样需要用 AltStore / SideStore / 爱思助手类工具签一次——这是所有侧载工具共同的“先有鸡还是先有蛋”，不是故障
+        三、免费 Apple ID 的限制（README 同步写明）
+        · 有效期 7 天：免费证书与描述文件 7 天到期，到期后 App 无法打开，续签后恢复，数据不丢
+        · App 数量上限：同一台设备上免费签名的 App 最多同时存在 3 个；7 天内可注册的 App ID 数量也有上限（约 10 个）
+        · 每个 App 的推送、App Groups 等部分能力在免费签名下不可用或受限
 
-        三、名词速记
-        · 免费证书：个人 Apple ID 申请的开发证书，有效期 7 天
-        · 描述文件（Provisioning Profile）：把证书、设备 UDID 和 App ID 绑在一起的文件，IPA 的到期时间主要看它
-        · 续签：到期前用同一 Apple ID 重新签名安装一遍，App 数据保留
+        四、个人使用范围提示
+        · 本工具仅供个人学习与自用：给自己拥有的设备、自己有权使用的 IPA 签名
+        · 请勿用于分发、代签收费、绕过付费或侵犯他人权益的用途
+        · 本助手自身也是一个未签名 IPA，首次安装同样需要先用 AltStore / SideStore 等工具签一次——这是所有侧载工具共同的前提，不是故障
         """
     }
 }
