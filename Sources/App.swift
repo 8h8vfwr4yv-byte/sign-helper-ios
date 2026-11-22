@@ -365,7 +365,7 @@ struct AppDetailView: View {
     }
 }
 
-// MARK: - 签名页（模式区分）
+// MARK: - 签名页（登录 + 模式区分）
 
 enum SignMode: String, CaseIterable, Identifiable {
     case backend = "后端签名"
@@ -381,21 +381,68 @@ struct SignView: View {
     @State private var selectedAppId: String = ""
     @AppStorage("backendEndpoint") private var endpoint: String = ""
     @AppStorage("savedAppleId") private var appleId: String = ""
+    @AppStorage("loggedInAppleId") private var loggedInAppleId: String = ""
     @State private var password: String = ""
     @State private var busy = false
+    @State private var notice: String = ""
     @State private var resultFile: URL? = nil
     @State private var resultNote: String = ""
 
     private var selectedApp: StoredApp? {
         library.apps.first { $0.id == selectedAppId } ?? library.apps.first
     }
+    private var isLoggedIn: Bool { !loggedInAppleId.isEmpty }
 
     var body: some View {
         NavigationStack {
             List {
+                Section("Apple ID 登录") {
+                    if isLoggedIn {
+                        HStack {
+                            Text("登录状态")
+                            Spacer()
+                            Text("已登录").foregroundStyle(.green)
+                        }
+                        row("Apple ID", loggedInAppleId)
+                        Button("退出登录", role: .destructive) {
+                            signLog.add("Apple ID 退出登录：\(loggedInAppleId)")
+                            loggedInAppleId = ""
+                            password = ""
+                            notice = "已退出登录。"
+                        }
+                    } else {
+                        TextField("Apple ID（邮箱）", text: $appleId)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.emailAddress)
+                        SecureField("密码", text: $password)
+                        Button {
+                            Task { await runLogin() }
+                        } label: {
+                            if busy {
+                                HStack { ProgressView(); Text("正在登录…") }
+                            } else {
+                                Label("登录", systemImage: "person.crop.circle")
+                            }
+                        }
+                    }
+                    Text("登录是向你自己配置的签名服务器验证身份，本 App 不直连苹果服务器（官方 SDK 也没有这套接口）。密码只保存在本次运行的内存里，不存设备、不写日志。还没填接口地址时点登录，会明确提示你先配置——不会再出现点不动、没反应的情况。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("后端签名接口") {
+                    TextField("接口地址（https://…，你自己的服务器）", text: $endpoint)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Text("接口约定：POST multipart/form-data。登录校验字段 apple_id、password、action=login，返回 HTTP 200 视为登录成功；签名字段同上并附文件字段 ipa，成功时直接返回签名后的 IPA 数据。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("选择 IPA") {
                     if library.apps.isEmpty {
-                        Text("IPA 库是空的，先到“IPA 库”页导入一个 IPA。")
+                        Text("IPA 库是空的。先到“IPA 库”页点 + 导入一个 IPA，再回来签名。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     } else {
@@ -418,36 +465,9 @@ struct SignView: View {
                     }
                     .pickerStyle(.segmented)
                     if mode == .backend {
-                        Text("后端模式：把 IPA 与 Apple ID 提交到你自己配置的签名服务器，由服务器完成向苹果申请证书、生成描述文件与重签名。本助手只做客户端提交与结果导出。")
+                        Text("后端模式：把 IPA 提交到你配置的服务器，由服务器完成向苹果申请证书、生成描述文件与重签名；本助手负责提交与导出结果。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
-                    } else {
-                        Text("本地模式（实验性）：依赖外部开源签名组件（如 ldid / zsign 类工具）在本机重签名。iOS 官方 SDK 没有内置代码签名接口，本构建未集成此类组件，高版本原生环境下也可能失效——此模式当前只记录流程日志并导出原始 IPA 副本。")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                if mode == .backend {
-                    Section("后端签名接口") {
-                        TextField("接口地址（https://…，你自己的服务器）", text: $endpoint)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        Text("接口约定：POST multipart/form-data，字段 apple_id、password，文件字段名为 ipa；成功时直接返回签名后的 IPA 文件数据。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Section("Apple ID 登录") {
-                        TextField("Apple ID（邮箱）", text: $appleId)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .keyboardType(.emailAddress)
-                        SecureField("密码（仅本次请求使用，不保存、不写日志）", text: $password)
-                        Text("密码只保存在内存里、随本次请求发给上面你自己配置的接口，用完即弃；不会存入设备、不会出现在日志中。没有你自己的签名服务器时请用本地模式或 AltStore / SideStore。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Section {
                         Button {
                             Task { await runBackendSign() }
                         } label: {
@@ -457,16 +477,23 @@ struct SignView: View {
                                 Label("登录并签名（后端）", systemImage: "signature")
                             }
                         }
-                        .disabled(busy || selectedApp == nil)
-                    }
-                } else {
-                    Section("本地签名（实验性）") {
+                    } else {
+                        Text("本地模式（实验性）：依赖外部开源签名组件（如 ldid / zsign 类工具）在本机重签名。iOS 官方 SDK 没有内置代码签名接口，本构建未集成此类组件，高版本原生环境下也可能失效——此模式只记录流程日志并导出原始 IPA 副本。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                         Button {
                             runLocalSign()
                         } label: {
                             Label("尝试本地签名（实验性）", systemImage: "flask")
                         }
-                        .disabled(selectedApp == nil)
+                    }
+                }
+
+                if !notice.isEmpty {
+                    Section("提示") {
+                        Text(notice)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -484,7 +511,7 @@ struct SignView: View {
                 }
 
                 Section("其他可行路线") {
-                    Text("没有自建后端时，成熟路线是 AltStore（电脑 AltServer 签名）或 SideStore（本机签名）：官网 altstore.io / sidestore.io，按其教程用 Apple ID 登录即可。本助手的价值在于签名之外：管理 IPA 库、解析到期时间、记录签名日志。")
+                    Text("没有自建后端、又想直接用 Apple ID 登录签名，用 AltStore（电脑 AltServer 签名）或 SideStore（本机签名）：官网 altstore.io / sidestore.io。它们实现了与苹果服务器的完整认证流程；本助手的定位是 IPA 管理、到期解析与签名流程演示。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -493,21 +520,82 @@ struct SignView: View {
         }
     }
 
-    // 后端签名：把 IPA 与 Apple ID 提交到用户配置的接口
-    private func runBackendSign() async {
-        guard let app = selectedApp else { return }
+    private func row(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value).foregroundStyle(.secondary).lineLimit(1)
+        }
+    }
+
+    // 登录：向用户配置的后端校验 Apple ID（本 App 不直连苹果服务器）
+    private func runLogin() async {
         let ep = endpoint.trimmingCharacters(in: .whitespaces)
         let aid = appleId.trimmingCharacters(in: .whitespaces)
+        guard !aid.isEmpty, !password.isEmpty else {
+            notice = "请先填写 Apple ID 和密码再点登录。"
+            signLog.add("登录未执行：Apple ID 或密码为空")
+            return
+        }
+        guard let url = URL(string: ep), ep.hasPrefix("https://") else {
+            notice = "还没有配置后端接口地址：本 App 不直连苹果服务器，登录需要先在上方填你自己签名服务器的 https 地址。没有服务器的话，请用 AltStore / SideStore 登录签名。"
+            signLog.add("登录未执行：未配置后端接口地址（本 App 不直连苹果服务器）")
+            return
+        }
+        busy = true
+        defer { busy = false }
+        do {
+            let boundary = "Boundary-\(UUID().uuidString)"
+            var body = Data()
+            func field(_ name: String, _ value: String) {
+                body.append("--\(boundary)\r\n".data(using: .utf8)!)
+                body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+                body.append("\(value)\r\n".data(using: .utf8)!)
+            }
+            field("apple_id", aid)
+            field("password", password)
+            field("action", "login")
+            body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            request.httpBody = body
+            request.timeoutInterval = 60
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if code == 200 {
+                loggedInAppleId = aid
+                notice = "登录成功（后端服务器已确认）。密码仍只保存在本次运行内存中，用于接下来的签名提交。"
+                signLog.add("Apple ID 登录成功（后端确认）：\(aid)")
+            } else {
+                notice = "登录失败：服务器返回 HTTP \(code)。请检查账号密码或接口实现。"
+                signLog.add("Apple ID 登录失败：HTTP \(code)")
+            }
+        } catch {
+            notice = "登录请求失败：\(error.localizedDescription)"
+            signLog.add("Apple ID 登录失败：\(error.localizedDescription)")
+        }
+    }
+
+    // 后端签名：把 IPA 与 Apple ID 提交到用户配置的接口
+    private func runBackendSign() async {
+        guard let app = selectedApp else {
+            notice = "IPA 库是空的：先到“IPA 库”页导入一个 IPA 再签名。"
+            signLog.add("后端签名未执行：未选择 IPA（库为空）")
+            return
+        }
+        let ep = endpoint.trimmingCharacters(in: .whitespaces)
+        let aid = isLoggedIn ? loggedInAppleId : appleId.trimmingCharacters(in: .whitespaces)
         signLog.add("后端签名开始：\(app.displayName)（\(app.bundleId)）")
         guard let url = URL(string: ep), ep.hasPrefix("https://") else {
             signLog.add("后端签名失败：未配置有效的 https 接口地址")
-            resultNote = "未配置后端接口地址，请先在上方填写你自己的签名服务器地址。"
+            notice = "未配置后端接口地址，请先在上方填写你自己的签名服务器地址。"
             resultFile = nil
             return
         }
         guard !aid.isEmpty, !password.isEmpty else {
-            signLog.add("后端签名失败：Apple ID 或密码为空")
-            resultNote = "请填写 Apple ID 与密码。"
+            signLog.add("后端签名失败：未登录（Apple ID 或密码为空）")
+            notice = "请先在上方登录（填写 Apple ID 与密码）。"
             resultFile = nil
             return
         }
@@ -538,7 +626,6 @@ struct SignView: View {
             request.timeoutInterval = 180
 
             let (data, response) = try await URLSession.shared.data(for: request)
-            password = ""
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
             if code == 200, data.count > 22, data.prefix(2).elementsEqual([0x50, 0x4B]) {
                 let outDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -548,31 +635,37 @@ struct SignView: View {
                 try data.write(to: outURL, options: .atomic)
                 resultFile = outURL
                 resultNote = "后端签名成功（\(formatBytes(data.count))），可导出后安装。"
+                notice = ""
                 signLog.add("后端签名成功：\(app.displayName)，结果 \(formatBytes(data.count))，已保存待导出")
             } else {
                 let snippet = String(data: data.prefix(200), encoding: .utf8) ?? ""
                 resultFile = nil
-                resultNote = "后端返回异常（HTTP \(code)），未得到签名 IPA。"
+                notice = "后端返回异常（HTTP \(code)），未得到签名 IPA。"
                 signLog.add("后端签名失败：HTTP \(code) \(snippet)")
             }
         } catch {
-            password = ""
             resultFile = nil
-            resultNote = "请求失败：\(error.localizedDescription)"
+            notice = "请求失败：\(error.localizedDescription)"
             signLog.add("后端签名失败：\(error.localizedDescription)")
         }
     }
 
     // 本地签名（实验性）：无官方接口、未集成外部组件——如实记录并导出原始副本
     private func runLocalSign() {
-        guard let app = selectedApp else { return }
+        guard let app = selectedApp else {
+            notice = "IPA 库是空的：先到“IPA 库”页导入一个 IPA 再试。"
+            signLog.add("本地签名未执行：未选择 IPA（库为空）")
+            return
+        }
         signLog.add("本地签名（实验性）开始：\(app.displayName)（\(app.bundleId)）")
         signLog.add("本地签名：iOS 官方 SDK 无内置代码签名接口，实验性签名依赖外部开源组件（ldid / zsign 类），本构建未集成")
         signLog.add("本地签名未执行：高版本原生环境下外部签名组件可能失效，导出结果为原始 IPA 副本（\(app.signed ? "保持原签名状态" : "仍未签名")）")
         resultFile = library.fileURL(for: app)
         resultNote = "本地签名（实验性）在本构建中未实际执行：导出的是原始 IPA 副本。真正签名请使用后端模式或 AltStore / SideStore。"
+        notice = ""
     }
 }
+
 
 // MARK: - 日志页
 
